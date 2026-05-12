@@ -333,63 +333,82 @@ _historical_data_cache: Dict[str, pd.DataFrame] = {}
 _historical_data_timestamp: Dict[str, float]    = {}
 
 
-async def fetch_historical_data(symbol: str, interval: int, limit: int = 500) -> Optional[pd.DataFrame]:
-    """Fetch historical klines con caché y validación."""
-    start_time = time.time()
+async def fetch_historical_data (symbol: str, interval: int, limit: int = 500) -> Optional[pd.DataFrame]:
+    """Fetch historical klines con refresco dinámico para evitar datos congelados."""
+    start_time = time.time ()
     cache_key = f"{symbol}_{interval}_{CONFIG['demo_trading']}"
-    current_time = time.time()
-    cache_valid = (interval * 60) - 30
+    current_time = time.time ()
+
+    # REDUCIDO: Solo cacheamos por 5 segundos para evitar el baneo de IP,
+    # pero permitir que el bot vea cambios de precio constantes.
+    cache_valid_seconds = 5
 
     if cache_key in _historical_data_timestamp:
-        if current_time - _historical_data_timestamp[cache_key] < cache_valid:
-            df = _historical_data_cache.get(cache_key)
+        if current_time - _historical_data_timestamp[cache_key] < cache_valid_seconds:
+            df = _historical_data_cache.get (cache_key)
             if df is not None and not df.empty:
-                PERFORMANCE_METRICS["data_fetch_time_total"] += (time.time() - start_time)
-                return df.copy()
+                # No sumamos tiempo de fetch si viene de caché para no sesgar métricas
+                return df.copy ()
 
-    session = SESSION_MANAGER.get_session()
-    for attempt in range(3):
+    session = SESSION_MANAGER.get_session ()
+    for attempt in range (3):
         try:
-            response = await async_bybit_call(
+            response = await async_bybit_call (
                 session.get_kline,
                 category=CONFIG["category"],
                 symbol=symbol,
-                interval=str(interval),
+                interval=str (interval),
                 limit=limit
             )
-            data = response.get("result", {}).get("list", [])
+
+            if response.get ("retCode") != 0:
+                logging.error (f"Bybit API Error: {response.get ('retMsg')} (Code: {response.get ('retCode')})")
+                await asyncio.sleep (1)
+                continue
+
+            data = response.get ("result", {}).get ("list", [])
             if not data:
-                logging.warning("No kline data received.")
+                logging.warning (f"No kline data received for {symbol}.")
                 return None
 
-            df = pd.DataFrame(data, columns=["open_time", "open", "high", "low", "close", "volume", "turnover"])
-            df["open_time"] = pd.to_datetime(pd.to_numeric(df["open_time"]), unit="ms", utc=True)
-            df.set_index("open_time", inplace=True)
-            df = df[["open", "high", "low", "close", "volume"]].astype(float)
-            df = df.sort_index()
+            # Conversión eficiente
+            df = pd.DataFrame (data, columns=["open_time", "open", "high", "low", "close", "volume", "turnover"])
+            df["open_time"] = pd.to_datetime (pd.to_numeric (df["open_time"]), unit="ms", utc=True)
+            df.set_index ("open_time", inplace=True)
 
-            # Filtrar outliers de precio
-            median_close = float(df["close"].median())
-            if median_close > 0:
-                mask = (df["close"] >= median_close * 0.2) & (df["close"] <= median_close * 5)
-                df = df[mask]
+            # Solo columnas necesarias y conversión a float
+            cols = ["open", "high", "low", "close", "volume"]
+            df = df[cols].apply (pd.to_numeric, errors='coerce').astype (float)
+            df = df.sort_index ()
 
-            # Filtrar spikes
-            pct_change = df["close"].pct_change().abs().fillna(0)
-            df = df[pct_change <= 0.3]
+            # Validación mínima: Si el DF es muy pequeño, los indicadores fallarán
+            if len (df) < 30:
+                logging.error ("Historial insuficiente para calcular indicadores.")
+                return None
 
-            if len(df) > CONFIG["data_retention_limit"]:
-                df = df.tail(CONFIG["data_retention_limit"])
+            # Limpieza de Outliers (Lógica corregida)
+            median_close = df["close"].median ()
+            df = df[(df["close"] >= median_close * 0.5) & (df["close"] <= median_close * 2.0)]
 
-            _historical_data_cache[cache_key]     = df.copy()
+            # Limpieza de Spikes (máximo 15% de cambio por vela en lugar de 30%)
+            df = df[df["close"].pct_change ().abs ().fillna (0) <= 0.15]
+
+            # Mantener límite de memoria
+            if len (df) > CONFIG["data_retention_limit"]:
+                df = df.tail (CONFIG["data_retention_limit"])
+
+            # Actualizar caché global
+            _historical_data_cache[cache_key] = df.copy ()
             _historical_data_timestamp[cache_key] = current_time
-            PERFORMANCE_METRICS["data_fetch_time_total"] += (time.time() - start_time)
-            return df
-        except Exception as e:
-            logging.warning(f"Fetch attempt {attempt+1} failed: {e}")
-            await asyncio.sleep(2)
 
-    logging.error("Failed to fetch historical data after retries.")
+            PERFORMANCE_METRICS["data_fetch_time_total"] += (time.time () - start_time)
+            return df
+
+        except Exception as e:
+            logging.warning (f"Fetch attempt {attempt + 1} failed for {symbol}: {e}")
+            await asyncio.sleep (1.5)
+
+    logging.error (f"Failed to fetch historical data for {symbol} after 3 retries.")
     return None
 
 
@@ -842,23 +861,27 @@ _funding_cache: Dict[str, float] = {}
 _funding_cache_ts: Dict[str, float] = {}
 
 
-async def get_fee_rates() -> Tuple[float, float]:
+async def get_fee_rates ():
     global MAKER_FEE, TAKER_FEE
     try:
-        session = SESSION_MANAGER.get_session()
-        fee_func = getattr(session, "get_fee_rates", None) or getattr(session, "get_fee_rate", None)
-        if fee_func is None:
-            return MAKER_FEE, TAKER_FEE
-        response = await async_bybit_call(fee_func, category=CONFIG["category"], symbol=CONFIG["symbol"])
-        if response.get("retCode") == 0:
-            fee_list = response.get("result", {}).get("list", [])
-            if fee_list:
-                MAKER_FEE = safe_float(fee_list[0], "makerFeeRate", 0.0002)
-                TAKER_FEE = safe_float(fee_list[0], "takerFeeRate", 0.00055)
-                logging.info(f"Fees: Maker {MAKER_FEE*100:.4f}%, Taker {TAKER_FEE*100:.4f}%")
+        session = SESSION_MANAGER.get_session ()
+        # Eliminamos 'symbol' y dejamos solo 'category' para evitar el error 10001
+        response = await async_bybit_call (
+            session.get_fee_rates,
+            category=CONFIG["category"]
+        )
+
+        if response.get ("retCode") == 0:
+            lst = response.get ("result", {}).get ("list", [])
+            if lst:
+                # Buscamos el symbol en la lista si Bybit lo devuelve filtrado
+                data = next ((item for item in lst if item.get ("symbol") == CONFIG["symbol"]), lst[0])
+                MAKER_FEE = float (data.get ("makerFeeRate", 0.0002))
+                TAKER_FEE = float (data.get ("takerFeeRate", 0.00055))
+                return
+        logging.warning ("⚠️ Usando fees por defecto debido a respuesta API inesperada.")
     except Exception as e:
-        logging.error(f"Error fetching fees: {e}")
-    return MAKER_FEE, TAKER_FEE
+        logging.error (f"❌ Error en get_fee_rates: {e}")
 
 
 async def get_funding_rate(symbol: str) -> Optional[float]:
@@ -1177,58 +1200,60 @@ class WebSocketManager:
         if self._loop:
             self._loop.call_soon_threadsafe(callback, *args)
 
-    async def _connect_private(self) -> bool:
-        for attempt in range(5):
+    async def _connect_private (self) -> bool:
+        # Sincronizamos testnet y demo para evitar el error 404
+        is_testnet = self.demo_trading
+
+        for attempt in range (5):
             try:
-                self.connected = False
                 if self.private_ws:
-                    try:
-                        await asyncio.to_thread(self.private_ws.close)
-                    except Exception:
-                        pass
-                self.private_ws = await asyncio.to_thread(
+                    await asyncio.to_thread (self.private_ws.exit)  # exit es más limpio en pybit v5
+
+                self.private_ws = await asyncio.to_thread (
                     WebSocket,
                     channel_type=self.private_channel_type,
-                    testnet=False,
-                    demo=self.demo_trading,
+                    testnet=is_testnet,
                     api_key=self.api_key,
                     api_secret=self.api_secret,
-                    ping_interval=CONFIG["websocket_ping_interval"],
-                    ping_timeout=CONFIG["websocket_ping_timeout"],
+                    # Eliminamos el parámetro 'demo' si testnet es True, pybit lo infiere
+                    ping_interval=int (CONFIG["websocket_ping_interval"]),
+                    ping_timeout=int (CONFIG["websocket_ping_timeout"]),
                 )
+
+                # Pequeña pausa para asegurar el handshake
+                await asyncio.sleep (1)
                 self.connected = True
-                logging.info("✅ Private WebSocket connected.")
+                logging.info (f"✅ Private WebSocket connected ({'Testnet' if is_testnet else 'Mainnet'}).")
                 return True
             except Exception as e:
-                logging.warning(f"Private WS connect attempt {attempt+1} failed: {e}")
-                await asyncio.sleep(min(2 ** attempt, 10))
-        logging.error("❌ Failed to connect private WebSocket.")
+                logging.warning (f"Private WS attempt {attempt + 1} failed: {e}")
+                await asyncio.sleep (min (2 ** attempt, 10))
         return False
 
-    async def _connect_public(self) -> bool:
-        for attempt in range(5):
+    async def _connect_public (self) -> bool:
+        is_testnet = self.demo_trading
+
+        for attempt in range (5):
             try:
-                self.public_connected = False
                 if self.public_ws:
-                    try:
-                        await asyncio.to_thread(self.public_ws.close)
-                    except Exception:
-                        pass
-                self.public_ws = await asyncio.to_thread(
+                    await asyncio.to_thread (self.public_ws.exit)
+
+                self.public_ws = await asyncio.to_thread (
                     WebSocket,
                     channel_type=self.public_channel_type,
-                    testnet=False,
-                    demo=False,
-                    ping_interval=CONFIG["websocket_ping_interval"],
-                    ping_timeout=CONFIG["websocket_ping_timeout"],
+                    testnet=is_testnet,
+                    # Las conexiones públicas NO llevan API Key
+                    ping_interval=int (CONFIG["websocket_ping_interval"]),
+                    ping_timeout=int (CONFIG["websocket_ping_timeout"]),
                 )
+
+                await asyncio.sleep (1)
                 self.public_connected = True
-                logging.info("✅ Public WebSocket connected.")
+                logging.info (f"✅ Public WebSocket connected ({'Testnet' if is_testnet else 'Mainnet'}).")
                 return True
             except Exception as e:
-                logging.warning(f"Public WS connect attempt {attempt+1} failed: {e}")
-                await asyncio.sleep(min(2 ** attempt, 10))
-        logging.error("❌ Failed to connect public WebSocket.")
+                logging.warning (f"Public WS attempt {attempt + 1} failed: {e}")
+                await asyncio.sleep (min (2 ** attempt, 10))
         return False
 
     def subscribe_fills(self, symbol: str) -> None:
